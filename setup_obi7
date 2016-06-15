@@ -1,0 +1,1044 @@
+#!/bin/bash
+
+# Choose the LDAP server closest to you.  Find it here:
+#
+#	https://stbeehive.oracle.com/teamcollab/wiki/IdM+-+Sun+-+Native+Ldap+Deployment:DSEE+Servers+for+Native+LDAP
+#
+# For example, if you're in Burlington, you would use this one:
+#	bur-ldap-01.us.oracle.com
+#
+# Stick with the default below if you're unsure.
+LDAP_SERVER='whqdevitldap.oraclecorp.com'
+#LDAP_SERVER='bur-ldap-01.oraclecorp.com'
+
+stime=`date +%Y-%m-%d-%H:%M:%S`
+
+function slt() {
+    a=`echo $2;echo $1`
+    b=`(echo $2;echo $1)|sort`
+    return `test "$a" != "$b"`
+}
+
+function savefile() {
+    file="$1"
+    if [ -f "$file" ] ; then
+	cp -p "$file" "$file.$stime"
+    fi
+}
+
+function fix_bashrc() {
+    echo -n "Updating root .bashrc..."
+    chmod 750 /root
+    savefile /root/.bashrc
+    chmod 550 /root
+    cat > /root/.bashrc<<\EOF
+# .bashrc
+
+# User specific aliases and functions
+
+# Source global definitions
+if [ -f /etc/bashrc ]; then
+        . /etc/bashrc
+fi
+
+if [ -n "$ENV" -a "$ENV" != /root/.bashrc -a -f "$ENV" ] ; then
+    . "$ENV"
+fi
+EOF
+    echo "Done"
+}
+
+function do_update() {
+    echo -n "System update..."
+    yum update -y
+    if [ $? -ne 0 ] ; then
+	echo "Update failed!"
+	exit 1
+    fi
+    echo "Update done"
+}
+
+function install_updates() {
+    do_update
+}
+
+function install_needed_packages() {
+    echo -n "Installing needed packages..."
+#    yum install -y crashplan-installer kernel-uek kernel-uek-devel kernel-uek-firmware krb5-auth-dialog libssh2 nscd nss-pam-ldapd openldap-clients openssl pam_ldap tigervnc VirtualBox-5.0
+    yum install -y autofs krb5-auth-dialog libssh2 nscd nss-pam-ldapd openldap-clients openssl pam_ldap tigervnc VirtualBox-5.0 krb5-workstation xorg-x11-fonts-100dpi xorg-x11-fonts-75dpi xorg-x11-fonts-ISO8859-1-100dpi xorg-x11-fonts-ISO8859-1-75dpi xorg-x11-fonts-misc xterm
+    if [ $? -ne 0 ] ; then
+	echo "Installing needed packages failed!"
+	exit 1
+    fi
+    echo "Done"
+}
+
+function install_source_control_tools() {
+    echo -n "Installing source control tools..."
+    yum install -y git-all git-cvs git-email git-gui gitk git hg-git mercurial python-dulwich subversion-perl
+    if [ $? -ne 0 ] ; then
+	echo "Installing source control tools failed!"
+	exit 1
+    fi
+    echo "Done"
+}
+
+function install_packages() {
+    install_needed_packages
+    install_source_control_tools
+}
+
+function clean_kernels() {
+    kernels=`rpm -qa |grep '^kernel-uek.*[a-z]-2\.6\.'`
+    if [ -n "$kernels" ] ; then
+	echo -n "Removing old uek kernels ($kernels)..."
+	rpm -e $kernels
+	echo "Done"
+    fi
+}
+
+function fix_grub() {
+    stanza=`grep '^title' /boot/grub/grub.conf | sed 's/.* //' | awk 'BEGIN {a=0;stanza=0;version=""} {if ($1 ~ /\(3\./ && \$1 > $version) {stanza=a;version=\$NR} a++;} END {print stanza}'`
+    if [ -n "$stanza" ] ; then
+	echo -n "Fixing grub.conf (boot 3.x kernel)..."
+	savefile /boot/grub/grub.conf
+	grep '^title' /boot/grub/grub.conf | sed 's/.* //' | awk "BEGIN {a=0} {if (a=$stanza) {print \"\$1 (\$a)\"} a++;}"
+	ed /boot/grub/grub.conf <<EOF
+1,\$s/^default=.*/default=$stanza/
+w
+q
+EOF
+	echo "Done"
+    fi
+}
+
+function fix_boot() {
+    echo '*** Skipping installation of UEK kernels'
+#    clean_kernels
+#    fix_grub
+}
+
+function check_ntpd() {
+    echo -n "Checking ntpd..."
+    service ntpd status >/dev/null 2>&1
+    if [ $? -ne 0 ] ; then
+	echo -n "not running! Starting ntpd..."
+	service ntpd start
+    fi
+    echo "Done"
+}
+
+function fix_display_mgr() {
+    if [[ -f /etc/kde/kdm/kdmrc ]]; then
+	echo -n "Fixing kdmrc..."
+	savefile /etc/kde/kdm/kdmrc
+	user=`grep /bin/bash /etc/passwd |awk -F: '{print $1}' |grep -v mysql |grep -v amandabackup |tail -1`
+	ed /etc/kde/kdm/kdmrc<<EOF
+1,\$s/^ShowUsers=NotHidden/ShowUsers=Selected/g
+1,\$s/^#SelectedUsers=.*/SelectedUsers=$user,root/g
+w
+q
+EOF
+	echo "Done"
+    fi
+}
+
+function fix_nsswitch() {
+    echo -n "Setting up nsswitch.conf..."
+    savefile /etc/nsswitch.conf
+    cat >/etc/nsswitch.conf<<\EOF
+aliases:    files ldap
+automount:  files ldap
+group:      files ldap
+passwd:     files ldap
+protocols:  files ldap
+rpc:        files ldap
+services:   files
+hosts:      files dns
+netgroup:   files ldap
+printers:   user files ldap
+auth_attr:  files
+bootparams: files
+ethers:     files
+ipnodes:    files
+netmasks:   files
+networks:   files
+prof_attr:  files
+project:    files
+publickey:  files
+tnrhdb:     files
+tnrhtp:     files
+shadow:     files ldap
+EOF
+    echo "Done"
+}
+
+function initialize_ldap() {
+    echo -n "Setting up ldap..."
+    authconfig --disablenis --passalgo=md5 --enableldapauth\
+         --enableldaptls --enableforcelegacy --enableldap\
+         --disablesssd --ldapserver=${LDAP_SERVER}\
+         --ldapbasedn=dc=oracle,dc=com --update --kickstart
+    cat >/etc/openldap/ldap.conf <<EOF
+SASL_NOCANON on
+URI ldaps://${LDAP_SERVER}
+BASE dc=oracle,dc=com
+TLS_REQCERT allow
+REFERRALS no
+EOF
+    echo "Done"
+}
+
+function setup_nslcd() {
+    echo -n "Setting up /etc/nslcd.conf..."
+    savefile /etc/nslcd.conf
+    cat >/etc/nslcd.conf <<EOF
+# This is the configuration file for the LDAP nameservice
+# switch library's nslcd daemon. It configures the mapping
+# between NSS names (see /etc/nsswitch.conf) and LDAP
+# information in the directory.
+# See the manual page nslcd.conf(5) for more information.
+
+# The uri pointing to the LDAP server to use for name lookups.
+# Multiple entries may be specified. The address that is used
+# here should be resolvable without using LDAP (obviously).
+#uri ldap://127.0.0.1/
+#uri ldaps://127.0.0.1/
+#uri ldapi://%2fvar%2frun%2fldapi_sock/
+# Note: %2f encodes the '/' used as directory separator
+# uri ldap://127.0.0.1/
+
+# The LDAP version to use (defaults to 3
+# if supported by client library)
+#ldap_version 3
+
+# The distinguished name of the search base.
+# base dc=example,dc=com
+
+# The distinguished name to bind to the server with.
+# Optional: default is to bind anonymously.
+#binddn cn=proxyuser,dc=example,dc=com
+
+# The credentials to bind with.
+# Optional: default is no credentials.
+# Note that if you set a bindpw you should check the permissions of this file.
+#bindpw secret
+
+# The distinguished name to perform password modifications by root by.
+#rootpwmoddn cn=admin,dc=example,dc=com
+
+# The default search scope.
+#scope sub
+#scope one
+#scope base
+
+# Customize certain database lookups.
+#base   group  ou=Groups,dc=example,dc=com
+#base   passwd ou=People,dc=example,dc=com
+#base   shadow ou=People,dc=example,dc=com
+#scope  group  onelevel
+#scope  hosts  sub
+
+# Bind/connect timelimit.
+#bind_timelimit 30
+
+# Search timelimit.
+#timelimit 30
+
+# Idle timelimit. nslcd will close connections if the
+# server has not been contacted for the number of seconds.
+#idle_timelimit 3600
+
+# Use StartTLS without verifying the server certificate.
+#ssl start_tls
+#tls_reqcert never
+
+# CA certificates for server certificate verification
+#tls_cacertdir /etc/ssl/certs
+#tls_cacertfile /etc/ssl/ca.cert
+
+# Seed the PRNG if /dev/urandom is not provided
+#tls_randfile /var/run/egd-pool
+
+# SSL cipher suite
+# See man ciphers for syntax
+#tls_ciphers TLSv1
+
+# Client certificate and key
+# Use these, if your server requires client authentication.
+#tls_cert
+#tls_key
+
+# NDS mappings
+#map group uniqueMember member
+
+# Mappings for Services for UNIX 3.5
+#filter passwd (objectClass=User)
+#map    passwd uid              msSFU30Name
+#map    passwd userPassword     msSFU30Password
+#map    passwd homeDirectory    msSFU30HomeDirectory
+#map    passwd homeDirectory    msSFUHomeDirectory
+#filter shadow (objectClass=User)
+#map    shadow uid              msSFU30Name
+#map    shadow userPassword     msSFU30Password
+#filter group  (objectClass=Group)
+#map    group  uniqueMember     msSFU30PosixMember
+
+# Mappings for Services for UNIX 2.0
+#filter passwd (objectClass=User)
+#map    passwd uid              msSFUName
+#map    passwd userPassword     msSFUPassword
+#map    passwd homeDirectory    msSFUHomeDirectory
+#map    passwd gecos            msSFUName
+#filter shadow (objectClass=User)
+#map    shadow uid              msSFUName
+#map    shadow userPassword     msSFUPassword
+#map    shadow shadowLastChange pwdLastSet
+#filter group  (objectClass=Group)
+#map    group  uniqueMember     posixMember
+
+# Mappings for Active Directory
+#pagesize 1000
+#referrals off
+#filter passwd (&(objectClass=user)(!(objectClass=computer))(uidNumber=*)(unixHomeDirectory=*))
+#map    passwd uid              sAMAccountName
+#map    passwd homeDirectory    unixHomeDirectory
+#map    passwd gecos            displayName
+#filter shadow (&(objectClass=user)(!(objectClass=computer))(uidNumber=*)(unixHomeDirectory=*))
+#map    shadow uid              sAMAccountName
+#map    shadow shadowLastChange pwdLastSet
+#filter group  (objectClass=group)
+#map    group  uniqueMember     member
+
+# Mappings for AIX SecureWay
+#filter passwd (objectClass=aixAccount)
+#map    passwd uid              userName
+#map    passwd userPassword     passwordChar
+#map    passwd uidNumber        uid
+#map    passwd gidNumber        gid
+#filter group  (objectClass=aixAccessGroup)
+#map    group  cn               groupName
+#map    group  uniqueMember     member
+#map    group  gidNumber        gid
+#uid nslcd
+#gid ldap
+#base dc=oracle,dc=com
+#ssl start_tls
+#tls_cacertdir /etc/openldap/cacerts
+# This comment prevents repeated auto-migration of settings.
+#uid nslcd
+#gid ldap
+uri ldaps://${LDAP_SERVER}/
+binddn cn=sun_admin,ou=adminusers,dc=oracle,dc=com
+bindpw sunds4sun
+ssl on
+tls_reqcert allow
+base dc=oracle,dc=com
+scope sub
+referrals no
+base passwd dc=oracle,dc=com
+scope passwd sub
+base shadow dc=oracle,dc=com
+scope shadow sub
+base group ou=groups,dc=oracle,dc=com
+base group ou=groups,ou=systems,dc=oracle,dc=com
+scope group one
+base netgroup ou=netgroup,dc=oracle,dc=com
+scope netgroup one
+base aliases ou=aliases,ou=sunit.oraclecorp.com,o=nl,dc=oracle,dc=com
+scope aliases one
+EOF
+    echo "Done"
+}
+
+function start_ldap_services() {
+    echo -n "Restarting name services and clearing caches..."
+    service nslcd restart
+    service nscd restart
+    nscd -i group
+    nscd -i passwd
+}
+
+function fix_nameservice() {
+    fix_nsswitch
+    initialize_ldap
+    setup_nslcd
+    start_ldap_services
+    echo "Done"
+}
+
+function fix_postfix() {
+    echo -n "Fixing email (postfix)..."
+    savefile /etc/postfix/main.cf
+    ed /etc/postfix/main.cf <<\EOF
+1,$s/^#mydomain = domain.tld/mydomain = oracle.com/
+1,$s/^#myorigin = $mydomain/myorigin = $mydomain/
+1,$s/^mydestination = $myhostname, localhost.$mydomain, localhost$/#mydestination = $myhostname, localhost.$mydomain, localhost/
+1,$s/^#relayhost = $mydomain/relayhost = $mydomain/
+w
+q
+EOF
+    service postfix status >/dev/null
+    if [ $? -eq 0 ] ; then
+	echo -n "Restarting postfix..."
+	service postfix restart
+    fi
+    echo "Done"
+}
+
+function setup_autofs_conf() {
+    echo -n "Setting up /etc/autofs.conf..."
+    savefile /etc/autofs.conf
+    ed /etc/autofs.conf <<\EOF
+1,$s/#mount_nfs_default_protocol = 3/mount_nfs_default_protocol = 3/
+1,$s/mount_nfs_default_protocol = 4/#mount_nfs_default_protocol = 4/
+w
+q
+EOF
+    echo "Done"
+}
+
+function setup_sysconfig_autofs() {
+    echo -n "Setting up /etc/sysconfig/autofs..."
+    savefile /etc/sysconfig/autofs
+    cat >/etc/sysconfig/autofs<<EOF
+#
+# Init syatem options
+#
+# If the kernel supports using the autofs miscellanous device
+# and you wish to use it you must set this configuration option
+# to "yes" otherwise it will not be used.
+#
+USE_MISC_DEVICE="yes"
+#
+# Use OPTIONS to add automount(8) command line options that
+# will be used when the daemon is started.
+#
+#OPTIONS=""
+#
+LDAP_URI="ldap://${LDAP_SERVER}/"
+TIMEOUT=300
+BROWSE_MODE="yes"
+MOUNT_NFS_DEFAULT_PROTOCOL=3
+MAP_OBJECT_CLASS="automountMap"
+ENTRY_OBJECT_CLASS="automount"
+MAP_ATTRIBUTE="automountMapName"
+ENTRY_ATTRIBUTE="automountKey"
+VALUE_ATTRIBUTE="automountInformation"
+SEARCH_BASE="ou=it.sfbay.sun.com,o=nl,dc=oracle,dc=com"
+EOF
+    echo "Done"
+}
+
+function setup_autofs_ldap_auth() {
+    echo -n "Fixing /etc/autofs_ldap_auth.conf..."
+    savefile /etc/autofs_ldap_auth.conf
+    cat >/etc/autofs_ldap_auth.conf<<\EOF
+<?xml version="1.0" ?>
+<!--
+This files contains a single entry with multiple attributes tied to it.
+See autofs_ldap_auth.conf(5) for more information.
+-->
+
+<autofs_ldap_sasl_conf
+        usetls="no"
+        tlsrequired="no"
+        authrequired="no"
+/>
+EOF
+    chmod 600 /etc/autofs_ldap_auth.conf
+    echo "Done"
+}
+
+function setup_auto_master() {
+    echo -n "Fixing /etc/auto.master..."
+    savefile /etc/auto.master
+    cat > /etc/auto.master<<\EOF
+#
+# Sample auto.master file
+# This is a 'master' automounter map and it has the following format:
+# mount-point [map-type[,format]:]map [options]
+# For details of the format look at auto.master(5).
+#
+#+auto_master
+/home   auto_home       -nobrowse vers=3
+#/misc  /etc/auto.misc
+#
+# NOTE: mounts done from a hosts map will be mounted with the
+#       "nosuid" and "nodev" options unless the "suid" and "dev"
+#       options are explicitly given.
+#
+/net    -hosts  vers=3
+#
+# Include central master map if it can be found using
+# nsswitch sources.
+#
+# Note that if there are entries for /net or /misc (as
+# above) in the included master map any keys that are the
+# same will not be seen as the first read key seen takes
+# precedence.
+/home ldap:automountMapName=auto_home,ou=it.sfbay.sun.com,o=nl,dc=oracle,dc=com vers=3
+/import ldap:automountMapName=auto_import,ou=it.sfbay.sun.com,o=nl,dc=oracle,dc=com vers=3
+/micro ldap:automountMapName=auto_micro,ou=sunit.oraclecorp.com,o=nl,dc=oracle,dc=com vers=3
+/re ldap:automountMapName=auto_re,ou=sunit.oraclecorp.com,o=nl,dc=oracle,dc=com vers=3
+/scde ldap:automountMapName=auto_scde,ou=it.sfbay.sun.com,o=nl,dc=oracle,dc=com vers=3
+/share ldap:automountMapName=auto_share,ou=it.sfbay.sun.com,o=nl,dc=oracle,dc=com vers=3
+/shared ldap:automountMapName=auto_shared,ou=it.sfbay.sun.com,o=nl,dc=oracle,dc=com vers=3
+/src ldap:automountMapName=auto_src,ou=it.sfbay.sun.com,o=nl,dc=oracle,dc=com vers=3
+/workspace ldap:automountMapName=auto_workspace,ou=sunit.oraclecorp.com,o=nl,dc=oracle,dc=com vers=3
+/ws ldap:automountMapName=auto_ws,ou=it.sfbay.sun.com,o=nl,dc=oracle,dc=com vers=3
+/wwss ldap:automountMapName=auto_wwss,ou=it.sfbay.sun.com,o=nl,dc=oracle,dc=com vers=3
+#
+# This contains /usr/dist and some other filesystems that normally should
+# not be mounted on Linux systems.
+#/- ldap:automountMapName=auto_direct,ou=storage,ou=sfbay,ou=systems,o=nl,dc=oracle,dc=com vers=3
+# This contains some Java things that normally should not be mounted
+# on Linux systems.
+#/java ldap:automountMapName=auto_java,ou=it.sfbay.sun.com,o=nl,dc=oracle,dc=com vers=3
+EOF
+    echo "Done"
+}
+
+function start_automount() {
+    echo -n "Restarting automount..."
+    systemctl enable autofs
+    service autofs restart
+    echo "Done"
+}
+
+function setup_automount() {
+    setup_autofs_conf
+    setup_sysconfig_autofs
+    setup_autofs_ldap_auth
+    setup_auto_master
+    start_automount
+}
+
+function setup_kerberos() {
+    echo -n "Setting up Kerberos..."
+    savefile /etc/krb5.conf
+    cat >/etc/krb5.conf <<\EOF
+#
+# WARNING: Comments in this file MUST begin with a # as the first character.  There cannot
+# be a space then a #
+
+[libdefaults]
+        default_realm = DEV.ORACLE.COM
+        dns_lookup_realm = false
+        dns_lookup_kdc = false
+        clockskew = 3600
+        allow_weak_crypto = yes
+#       default_tkt_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96 des3-cbc-sha1-kd arcfour-hmac-md5 arcfour-hmac-md5-exp des-cbc-md5 des-cbc-crc
+        verify_ap_req_nofail = false
+
+[realms]
+        DEV.ORACLE.COM = {
+                kdc = devkdc.oraclecorp.com:88
+                kdc = devkdc01.oraclecorp.com:88
+                kdc = devkdc02.oraclecorp.com:88
+                kdc = devkdc03.oraclecorp.com:88
+                admin_server = devkdc.oraclecorp.com
+        }
+
+[domain_realm]
+        .com = DEV.ORACLE.COM
+
+[logging]
+        default = FILE:/var/krb5/krb5.log
+
+[appdefaults]
+        kinit = {
+                forwardable = true
+                proxiable = true
+                renewable = true
+                no_address = true
+        }
+EOF
+    mkdir -p /etc/krb5
+    touch /etc/krb5/krb5.keytab
+    chmod 600 /etc/krb5/krb5.keytab
+    echo "Done"
+}
+
+function install_proxyt() {
+    echo -n "Installing transparent proxy v2.99.02.1..."
+    base64 -d >/tmp/proxyt$$.rpm <<EOF
+7avu2wMAAAAAAXByb3h5dC0yLjk5LjAyLjEtMTAuZWw3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAABAAUAAAAAAAAAAAAAAAAAAAAAjq3oAQAAAAAAAAAFAAAAVAAA
+AD4AAAAHAAAARAAAABAAAAENAAAABgAAAAAAAAABAAAD6AAAAAQAAAAsAAAAAQAAA+wAAAAHAAAA
+MAAAABAAAAPvAAAABAAAAEAAAAABMDI1YTNhOTkyNTE4ZTVlODMzYjk5MTYyYzI3Y2JhNTE1MWY5
+NGEwNwAAAAAAAFrYtZa3Pez70k5y3jlSBndsJwAA6MAAAAA+AAAAB////7AAAAAQAAAAAI6t6AEA
+AAAAAAAANQAAEbQAAAA/AAAABwAAEaQAAAAQAAAAZAAAAAgAAAAAAAAAAQAAA+gAAAAGAAAAAgAA
+AAEAAAPpAAAABgAAAAkAAAABAAAD6gAAAAYAAAATAAAAAQAAA+wAAAAJAAAAGgAAAAEAAAPtAAAA
+CQAAAC8AAAABAAAD7gAAAAQAAAI4AAAAAQAAA+8AAAAGAAACPAAAAAEAAAPxAAAABAAAAkwAAAAB
+AAAD9gAAAAYAAAJQAAAAAQAAA/gAAAAJAAACVwAAAAEAAAP9AAAABgAAAmMAAAABAAAD/gAAAAYA
+AAJpAAAAAQAABAQAAAAEAAACcAAAAAkAAAQGAAAAAwAAApQAAAAJAAAECQAAAAMAAAKmAAAACQAA
+BAoAAAAEAAACuAAAAAkAAAQLAAAACAAAAtwAAAAJAAAEDAAAAAgAAAUlAAAACQAABA0AAAAEAAAF
+MAAAAAkAAAQPAAAACAAABVQAAAAJAAAEEAAAAAgAAAWBAAAACQAABBQAAAAGAAAFrgAAAAEAAAQV
+AAAABAAABdAAAAAJAAAEFwAAAAgAAAX0AAAAAwAABBgAAAAEAAAGHAAAABQAAAQZAAAACAAABmwA
+AAAUAAAEGgAAAAgAAAhGAAAAFAAABCgAAAAGAAAIggAAAAEAAAQ4AAAABAAACIwAAAALAAAEOQAA
+AAgAAAi4AAAACwAABDoAAAAIAAAK4AAAAAsAAARHAAAABAAADKwAAAAJAAAESAAAAAQAAAzQAAAA
+CQAABEkAAAAIAAAM9AAAAAkAAARYAAAABAAADQAAAAADAAAEWQAAAAgAAA0MAAAAAwAABFwAAAAE
+AAANQAAAAAkAAARdAAAACAAADWQAAAAJAAAEXgAAAAgAAA3DAAAABgAABGIAAAAGAAAOOQAAAAEA
+AARkAAAABgAADtAAAAABAAAEZQAAAAYAAA7VAAAAAQAABGYAAAAGAAAO2AAAAAEAAARsAAAABgAA
+DtoAAAABAAAEdAAAAAQAAA70AAAACQAABHUAAAAEAAAPGAAAAAkAAAR2AAAACAAADzwAAAAFAAAE
+dwAAAAQAABEIAAAACQAABHgAAAAEAAARLAAAAAkAAAR5AAAABAAAEVAAAAAUAAATkwAAAAQAABGg
+AAAAAUMAcHJveHl0ADIuOTkuMDIuMQAxMC5lbDcAQSB0cmFuc3BhcmVudCBwcm94eS4AVGhlIHRy
+YW5zcGFyZW50IHByb3h5IGlzIGEgcHJveHkgdGhhdCB5b3UgaW5zdGFsbCBhbmQgZm9yZ2V0LgoK
+UmF0aGVyIHRoYW4gcmVseWluZyBvbiBpbmRpdmlkdWFsIHByb2dyYW1zIGJlaW5nIGNvbmZpZ3Vy
+ZWQgdG8gZ2V0IGEKcHJveHkgZnJvbSBhIGNvbmZpZ3VyYXRpb24gZmlsZSwgZW52aXJvbm1lbnQg
+dmFyaWFibGUgb3Igd3BhZC5kYXQsCnByb3h5dCBzaW1wbHkgaW50ZXJjZXB0cyBjb25uZWN0aW9u
+cyB0byB0aGUgb3V0c2lkZSB3b3JsZCBhbmQKcmVkaXJlY3RzIHRoZW0gdG8gYSBwcm94eS4gIEFw
+cGxpY2F0aW9ucyBkbyBub3QgbmVlZCB0byBiZSBtb2RpZmllZCwKc3BlY2lhbGx5IGNvbmZpZ3Vy
+ZWQgb3IgZ2VuZXJhbGx5IG1lc3NlZCB3aXRoOiB0aGV5IGFyZSBvYmxpdmlvdXMgdG8KdGhlIGZh
+Y3QgdGhhdCB0aGVpciBjb25uZWN0aW9ucyBhcmUgZ29pbmcgdGhyb3VnaCBhIGNpcmN1aXRvdXMg
+cm91dGUKdG8gdGhlaXIgZmluYWwgZGVzdGluYXRpb24uCgpZb3UgcmVhbGx5IHdhbnQgdGhpcy4A
+AABWadGFcmtyYXdpdHotbGludXgAAAAA41lHUEx2MisAVW5zcGVjaWZpZWQAbGludXgAeDg2XzY0
+AAAADMAAAA54AAADGwAACA8AAAD4AAAEuwAAAPwAAIn4AAAsUIHtge2BpIGkgaSB7YHtge2B7QAA
+AAAAAAAAAAAAAAAAAAAAAFZp0YRWadGEVmnRhFZp0YRWadGEVmnRhFZp0YRWadGFVmnRhTQzN2Y0
+NTdlYWE1MDE5OGYyODM3NzI4YTgyMTU3YTI4OGI0NWNkNTI4ZmI1ZTM5OTA0NTgxMzQ4NzIzNzVi
+MTYAMWZkNmNmMTBmY2FiYzY3NDI1ZDlmZTJiNzZlMjg4NzE4YjQ0MDUwN2EwMjBmNWFkNDZkMzdj
+Y2ZhNTY0YWVjZgA0ZDUzNzA1M2Y4OWYwNjIxNzNlMTk4YWFhODZhN2Q2MzRkMGM0ZmVhZmQ5MTk5
+YjY1YjJjZjc5Y2NhODE0YzYxADk4ZmQzNDg4OTQ2ZjIxNTYzZmJmOGRiNWI3MjExOGI0MGIwNDZi
+NjdhMjI1MTcyZjM1ZDAxZDlmMWRkOWIyODMAN2M2MzVhYTA1N2JhMDYzNjRlYWUxNzVlMzkxOTJl
+NGM2MGZhNTAyOGEzNDkzNDA4YTgzMGU3MzZiZmE4MTkzNQA2Y2JiY2M4ODhjN2NkZjQ2Y2MyZGI1
+MDM3ZDI2ZGY5YTg3M2FiYzY4NWQxNjA2OGMwNDE2ZjQ2NzEyZTI4MDkyADU2YWY1ZjI5YTUyZDM2
+NjU2ZGQ5YTJkODg5YTM3NGFhYjA0NzVmMjU3MDVlZWI4NTY2ZTUxY2ViMGJlZTk4OTkANDJhNGUw
+MmY0MGJiMDIzMWRhNzY0NThlYjgzYWRiNWIxOTU4MzM2NDFmM2VjNzNiZmEzMmFlYmVlYThlNjBl
+YwA4MWQzYzI3NWY4MmQ4YWY1YmFjNmNiZWNjN2E2MWQ2OTM5NDU4ZTFmNGM2ZDUxMTk4ODBiOTE2
+MjY0OGY5ZjczAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARAAAAEQAAAAAAAAAAAAAAAAAAAAAAAAAA
+cm9vdAByb290AHJvb3QAcm9vdAByb290AHJvb3QAcm9vdAByb290AHJvb3QAcm9vdAByb290AHJv
+b3QAcm9vdAByb290AHJvb3QAcm9vdAByb290AHJvb3QAcHJveHl0LTIuOTkuMDIuMS0xMC5lbDcu
+c3JjLnJwbQAAAP///////////////////////////////////////////////2NvbmZpZyhwcm94
+eXQpAHByb3h5dABwcm94eXQoeDg2LTY0KQAAAAAAAEAAAABAABAAAAgAAAAAAABAAAAAQAAAAEAA
+AABAAAAAQAAAAEAAAABAAAAAQAAAAEAAAABAAAAAQAABAAAKAQAACgEAAAoAAEAAAQAACi9iaW4v
+YmFzaAAvYmluL3NoAGNvbmZpZyhwcm94eXQpAGlwdGFibGVzAGxpYmMuc28uNigpKDY0Yml0KQBs
+aWJjLnNvLjYoR0xJQkNfMi4xNCkoNjRiaXQpAGxpYmMuc28uNihHTElCQ18yLjE1KSg2NGJpdCkA
+bGliYy5zby42KEdMSUJDXzIuMi41KSg2NGJpdCkAbGliYy5zby42KEdMSUJDXzIuMykoNjRiaXQp
+AGxpYmMuc28uNihHTElCQ18yLjMuNCkoNjRiaXQpAGxpYmMuc28uNihHTElCQ18yLjQpKDY0Yml0
+KQBsaWJjLnNvLjYoR0xJQkNfMi43KSg2NGJpdCkAbGlicHRocmVhZC5zby4wKCkoNjRiaXQpAGxp
+YnB0aHJlYWQuc28uMChHTElCQ18yLjIuNSkoNjRiaXQpAGxpYnB0aHJlYWQuc28uMChHTElCQ18y
+LjMuMikoNjRiaXQpAHJwbWxpYihDb21wcmVzc2VkRmlsZU5hbWVzKQBycG1saWIoRmlsZURpZ2Vz
+dHMpAHJwbWxpYihQYXlsb2FkRmlsZXNIYXZlUHJlZml4KQBydGxkKEdOVV9IQVNIKQBycG1saWIo
+UGF5bG9hZElzWHopAAAAMi45OS4wMi4xLTEwLmVsNwAAAAAAAAAAAAAAAAAzLjAuNC0xADQuNi4w
+LTEANC4wLTEAADUuMi0xADQuMTEuMwAAAABV5ZNAVd77wFXXEsBVm79AVZUnwFU43sBVON7AVTje
+wFTclcBUx33AVMd9wEpvaG4gSGF4YnkgPGpvaG4uaGF4YnlAb3JhY2xlLmNvbT4gLSAyLjk5LjAz
+LTEAUm9iZXJ0IEtyYXdpdHogPHJvYmVydC5rcmF3aXR6QG9yYWNsZS5jb20+IC0gMi45OS4wMi4x
+LTkAUm9iZXJ0IEtyYXdpdHogPHJvYmVydC5rcmF3aXR6QG9yYWNsZS5jb20+IC0gMi45OS4wMi4x
+LTMASm9obiBIYXhieSA8am9obi5oYXhieUBvcmFjbGUuY29tPiAtIDIuOTkuMDEtMQBKb2huIEhh
+eGJ5IDxqb2huLmhheGJ5QG9yYWNsZS5jb20+IC0gMi45OS0xAFJvYmVydCBLcmF3aXR6IDxyb2Jl
+cnQua3Jhd2l0ekBvcmFjbGUuY29tPiAtIDIuMC4zLjEtMgBSb2JlcnQgS3Jhd2l0eiA8cm9iZXJ0
+LmtyYXdpdHpAb3JhY2xlLmNvbT4gLSAyLjAuMy4xLTEASm9obiBIYXhieSA8am9obi5oYXhieUBv
+cmFjbGUuY29tPiAtIDIuMC4zLTEAUm9iZXJ0IEtyYXdpdHogPHJvYmVydC5rcmF3aXR6QG9yYWNs
+ZS5jb20+IC0gMi4wLjIuMS0xAEpvaG4gSGF4YnkgPGpvaG4uaGF4YnlAb3JhY2xlLmNvbT4gLSAy
+LjAuMi0xAEpvaG4gSGF4YnkgPGpvaG4uaGF4YnlAb3JhY2xlLmNvbT4gLSAyLjAuMS0xAC0gQWRk
+IGF1dG9tYXRpY2FsbHkgY29uZmlndXJlZCBwcm94eSB0aHJvdWdoIHByb3h5dGN0bAAtIENsZWFu
+IHVwIGEgbnVtYmVyIG9mIGJ1aWxkIGlzc3Vlcy4ALSBDb3JyZWN0bHkgaGFuZGxlIC9ydW4gbm90
+IGJlaW5nIGRlZmluZWQuAC0gVXBkYXRlIGZvciBwcm94eXQtbG9hZCBhbmQgcHJveHl0LXVubG9h
+ZAAtIFVwZGF0ZSBmb3IgcHJveHl0Y3RsAC0gQ2xlYW4gdXAgbGVmdG92ZXJzIGZyb20gbWVyZ2Uu
+AC0gTWVyZ2UgMi4wLjIuMSBhbmQgMi4wLjIuMiBjaGFuZ2VzAC0gQWRkIHByb3h5dF9wcmVwZW5k
+X3J1bGVzIGZvciBleHRyYSBpcHRhYmxlcyBydWxlcyBpbiBhIGdpdmVuIGNvbmZpZy4KICAoVGhh
+bmtzIHRvIFRvZGQgVmllcmxpbmcpAC0gSW5zdGFsbCAvdXNyL2xpYi9zeXN0ZW1kL3N5c3RlbS8q
+IG9uIHN1c2UALSBCZXR0ZXIgZXJyb3IgaGFuZGxpbmcALSBGaXJzdCBSUE0gcmV2aXNvbgAAAAAA
+AAABAAAAAQAAAAEAAAABAAAAAQAAAAEAAAABAAAAAQAAAAEAAAABAAAAAgAAAAMAAAAEAAAABQAA
+AAYAAAAHAAAACAAAAAkAAAAAAAAAAAAAAAAQAAAIAAAACAAAAAgyLjk5LjAyLjEtMTAuZWw3ADIu
+OTkuMDIuMS0xMC5lbDcAMi45OS4wMi4xLTEwLmVsNwAAAAAAAAAAAAEAAAACAAAAAgAAAAMAAAAE
+AAAABAAAAAUAAAAFOTBwcm94eXQAcHJveHl0AHByb3h5dABwcm94eXQub3JhY2xlAHByb3h5dC5z
+ZXJ2aWNlAHByb3h5dC1sb2FkAHByb3h5dC11bmxvYWQAcHJveHl0AHByb3h5dGN0bAAvZXRjL05l
+dHdvcmtNYW5hZ2VyL2Rpc3BhdGNoZXIuZC8AL2V0Yy9yYy5kL2luaXQuZC8AL2V0Yy9zeXNjb25m
+aWcvAC91c3IvbGliL3N5c3RlbWQvc3lzdGVtLwAvdXNyL2xpYmV4ZWMvAC91c3Ivc2Jpbi8ALU8y
+IC1nIC1waXBlIC1XYWxsIC1XcCwtRF9GT1JUSUZZX1NPVVJDRT0yIC1mZXhjZXB0aW9ucyAtZnN0
+YWNrLXByb3RlY3Rvci1zdHJvbmcgLS1wYXJhbT1zc3AtYnVmZmVyLXNpemU9NCAtZ3JlY29yZC1n
+Y2Mtc3dpdGNoZXMgICAtbTY0IC1tdHVuZT1nZW5lcmljAGNwaW8AeHoAMgB4ODZfNjQtcmVkaGF0
+LWxpbnV4LWdudQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAgAAAAAAAAAB
+AAAAAgAAAAIAAAACAAAAAAAAAAAAAAADAAAABFBPU0lYIHNoZWxsIHNjcmlwdCwgQVNDSUkgdGV4
+dCBleGVjdXRhYmxlAEJvdXJuZS1BZ2FpbiBzaGVsbCBzY3JpcHQsIEFTQ0lJIHRleHQgZXhlY3V0
+YWJsZQBBU0NJSSB0ZXh0AEVMRiA2NC1iaXQgTFNCIGV4ZWN1dGFibGUsIHg4Ni02NCwgdmVyc2lv
+biAxIChTWVNWKSwgZHluYW1pY2FsbHkgbGlua2VkICh1c2VzIHNoYXJlZCBsaWJzKSwgZm9yIEdO
+VS9MaW51eCAyLjYuMzIsIEJ1aWxkSURbc2hhMV09Y2U5ZTllOTZiODBhN2M1NjgwNjg4ZDVkYzE0
+NzIwOWQ4OTgzOWQwMiwgc3RyaXBwZWQARUxGIDY0LWJpdCBMU0IgZXhlY3V0YWJsZSwgeDg2LTY0
+LCB2ZXJzaW9uIDEgKFNZU1YpLCBkeW5hbWljYWxseSBsaW5rZWQgKHVzZXMgc2hhcmVkIGxpYnMp
+LCBmb3IgR05VL0xpbnV4IDIuNi4zMiwgQnVpbGRJRFtzaGExXT1mZDMzMDI5OTZlODgwY2JkZmRj
+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
+EOF
+    yum install -y /tmp/proxyt$$.rpm
+    rm -f /tmp/proxyt$$.rpm
+    service NetworkManager status >/dev/null
+    if [ $? = 0 ] ; then
+	echo -n "Restarting NetworkManager..."
+	service NetworkManager restart
+    fi
+    echo "Done"
+}
+
+function check_vpn_version() {
+    desired_vpn_version='4,1,06020'
+    des_vpn_1="`echo $desired_vpn_version |sed 's/,/./g'`"
+    vpn_version_file=/opt/cisco/anyconnect/update.txt
+    vpn_package="anyconnect-linux-64bit-${des_vpn_1}-k9.tar.gz"
+    installed_vpn_version=`cat "$vpn_version_file" 2>/dev/null`
+    vpn_download="https://vsupport.oracle.com/downloads/software/$vpn_package"
+    if [ ! -f "$vpn_version_file" ] ; then
+	echo '****************************************************************'
+	echo "VPN does not appear to be installed!  Please download and install"
+	echo "$vpn_download"
+	echo "To install the package:"
+	echo
+	echo "1) Download the package into your home directory."
+	echo
+	echo "2) Unpack it:"
+	echo "   tar xvf $vpn_package"
+	echo
+	echo "3) Complete the installation:"
+	echo "   cd anyconnect-${des_vpn_1}/vpn"
+	echo "   sudo ./vpn_install.sh"
+    elif slt "$installed_vpn_version" "$desired_vpn_version" ; then
+	echo '****************************************************************'
+	echo "VPN appears to be out of date."
+	echo "The installed version is $installed_vpn_version, but it should be at least $desired_vpn_version."
+	echo "Please download and install"
+	echo "$vpn_download"
+	echo "To install the package:"
+	echo
+	echo "1) Download the package into your home directory."
+	echo
+	echo "2) Unpack it:"
+	echo "   tar xvf $vpn_package"
+	echo
+	echo "3) Complete the installation:"
+	echo "   cd anyconnect-${des_vpn_1}/vpn"
+	echo "   sudo ./vpn_install.sh"
+    fi
+}
+
+fix_bashrc
+install_updates
+install_packages
+#clean_kernels
+fix_boot
+fix_display_mgr
+fix_nameservice
+fix_postfix
+setup_automount
+setup_kerberos
+install_proxyt
+check_vpn_version
+
+echo "Done"
+echo 'Now run kinit and klist as yourself and test automounts!'
